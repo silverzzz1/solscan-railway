@@ -1,5 +1,2 @@
-requests
-playwright
-beautifulsoup4
-selenium
-pandas
+playwright==1.46.0
+requests==2.32.3
