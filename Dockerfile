@@ -5,8 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Ensure Playwright is available and Chromium installed
-# (use module form so it works even if CLI isn't on PATH)
+# Install browsers via module form (works even if CLI isn't on PATH)
 RUN python -m playwright install chromium || true
 
 COPY solscan_railway.py .
