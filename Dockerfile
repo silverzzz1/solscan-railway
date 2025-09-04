@@ -1,14 +1,17 @@
+# Playwright + Chromium preinstalled (no font/apt hell)
 FROM mcr.microsoft.com/playwright/python:v1.46.0-jammy
 
 WORKDIR /app
 
+# Install Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# copy your whole repo (so whatever the script is named, it’s there)
-COPY . /app
+# Bring your code in
+COPY solscan_railway.py /app/app.py
 
+# Better logging
 ENV PYTHONUNBUFFERED=1
 
-# run YOUR actual file name; change it if different
-CMD ["bash","-lc","python solscan_railway.py --url \"$URL\""]
+# URL comes from Render env var “URL”
+CMD ["bash","-lc","python app.py --url \"$URL\""]
