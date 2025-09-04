@@ -1,5 +1,5 @@
-# solscan_railway.py
 # Headless Playwright script to monitor buy transactions on CabalSpy
+# QUIET MODE: Only prints when finds >=20 SOL grouped buys and sends a desktop popup (local) or just logs in cloud.
 
 import asyncio
 import re
@@ -11,87 +11,85 @@ from collections import defaultdict
 from playwright.async_api import async_playwright
 from playwright.async_api import TimeoutError as PWTimeoutError
 
-# --- Windows desktop popup (local fallback) ---
+# Local Windows popup (ignored in cloud)
 import threading, ctypes
 def desktop_popup(title: str, message: str):
     def _show():
         try:
-            # 0x00001040 = MB_OK | MB_ICONINFORMATION
             ctypes.windll.user32.MessageBoxW(0, message, title, 0x00001040)
         except Exception:
             pass
     threading.Thread(target=_show, daemon=True).start()
 
-# --- Discord webhook for cloud alerts ---
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "").strip()
-
 def parse_time_ago(time_str: str) -> int:
-    """
-    Converts strings like "1m ago", "5s ago", "2h ago" into minutes.
-    """
+    """Convert '5s ago', '2m ago', '1h ago' → minutes."""
     if not time_str:
         return 999
-    numbers = re.findall(r'\d+', time_str)
-    if not numbers:
+    nums = re.findall(r'\d+', time_str)
+    if not nums:
         return 999
-    value = int(numbers[0])
+    v = int(nums[0])
     if 's' in time_str:
         return 0
     if 'm' in time_str:
-        return value
+        return v
     if 'h' in time_str:
-        return value * 60
+        return v * 60
     if 'd' in time_str:
-        return value * 1440
-    return value
+        return v * 1440
+    return v
 
 async def monitor_buys(url: str):
     async with async_playwright() as p:
-        # >>> Modified line: add --no-sandbox and --disable-dev-shm-usage <<<
+        # IMPORTANT for Render/containers
         browser = await p.chromium.launch(
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
         page = await browser.new_page()
-        print(f"Navigating to {url}")
+
+        print(f"🚀 Starting quiet monitor for {url}")
+        print("📊 Monitoring for buys over 20 SOL... (terminal stays quiet until alerts)")
+        print("=" * 70)
+
         await page.goto(url, timeout=60000)
 
         alert_timestamps = {}
         ALERT_COOLDOWN_SECONDS = 3600  # 1 hour
+        cycle_count = 0
 
         while True:
-            print("\n" + "="*50)
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Refreshing page and checking for new buys...")
+            cycle_count += 1
 
-            # Robust reload so timeouts don't crash the script
+            # “alive” ping every 10 minutes
+            if cycle_count % 10 == 0:
+                print(f"⏰ Still monitoring... ({cycle_count} checks completed)")
+
+            # Reload page, with recovery
             try:
                 await page.reload(wait_until="domcontentloaded", timeout=60000)
             except PWTimeoutError:
-                print("Reload timed out; attempting recovery without exiting...")
-                # Try a gentle JS refresh first
                 try:
                     await page.evaluate("location.reload()")
                     await page.wait_for_load_state("domcontentloaded", timeout=60000)
                 except Exception:
-                    # Fall back to a hard goto on the same URL
                     try:
                         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                    except Exception as e:
-                        print(f"Secondary reload failed: {e}. Will retry next cycle.")
+                    except Exception:
+                        if cycle_count % 5 == 0:
+                            print(f"⚠️  Connection issues detected (attempt {cycle_count})")
                         await page.wait_for_timeout(5000)
-                        print("\nWaiting 2 minutes before next refresh...")
-                        await page.wait_for_timeout(120000)
                         continue
 
-            await page.wait_for_timeout(4000)  # wait for JS to load table
+            await page.wait_for_timeout(4000)  # let JS populate
 
+            # Grab rows
             try:
                 table = await page.query_selector("#transactions-table")
                 rows = await table.query_selector_all("tr")
             except Exception:
-                print("ERROR: Could not find transaction table.")
-                print("\nWaiting 2 minutes before next refresh...")
-                await page.wait_for_timeout(120000)
+                # stay quiet; try next loop
+                await page.wait_for_timeout(60000)
                 continue
 
             buy_transactions = []
@@ -110,89 +108,65 @@ async def monitor_buys(url: str):
                     time_ago_str = await cells[4].inner_text()
                     minutes_ago = parse_time_ago(time_ago_str)
 
-                    buy_transactions.append({
-                        "token": token_name,
-                        "amount": amount,
-                        "time": minutes_ago
-                    })
+                    buy_transactions.append({"token": token_name, "amount": amount, "time": minutes_ago})
                 except Exception:
                     continue
 
-            if not buy_transactions:
-                print("No 'buy' transactions found.")
-            else:
-                grouped_by_token = defaultdict(list)
+            if buy_transactions:
+                grouped = defaultdict(list)
                 for tx in buy_transactions:
-                    grouped_by_token[tx['token']].append(tx)
+                    grouped[tx["token"]].append(tx)
 
-                print("--- Aggregated BUY Transactions (within 8-minute windows) ---")
+                alerts_triggered = False
 
-                for token, transactions in grouped_by_token.items():
-                    transactions.sort(key=lambda x: x['time'], reverse=True)
-                    if not transactions:
+                for token, txs in grouped.items():
+                    txs.sort(key=lambda x: x["time"], reverse=True)
+                    if not txs:
                         continue
 
-                    current_group_total = 0
-                    group_start_time = transactions[0]['time']
+                    current_total = 0.0
+                    group_start = txs[0]["time"]
 
-                    for tx in transactions:
-                        if tx['time'] - group_start_time <= 3:
-                            current_group_total += tx['amount']
+                    for tx in txs:
+                        if tx["time"] - group_start <= 3:
+                            current_total += tx["amount"]
                         else:
-                            if current_group_total > 0:
-                                print(f"  - Token: {token:<10} | Total Buy: {current_group_total:.2f} SOL")
-                                if current_group_total > 20:
-                                    now = time.time()
-                                    if not alert_timestamps.get(token) or (now - alert_timestamps[token] > ALERT_COOLDOWN_SECONDS):
-                                        print(f"!!! ALERT: High volume buy for {token} !!!")
-                                        if DISCORD_WEBHOOK:
-                                            try:
-                                                requests.post(
-                                                    DISCORD_WEBHOOK,
-                                                    json={"content": f"High Volume Buy — {token}: {current_group_total:.2f} SOL"},
-                                                    timeout=8
-                                                )
-                                            except Exception:
-                                                pass
-                                        else:
-                                            desktop_popup(
-                                                "High Volume Buy",
-                                                f"{token}: {current_group_total:.2f} SOL (>=20)"
-                                            )
-                                        alert_timestamps[token] = now
-                            group_start_time = tx['time']
-                            current_group_total = tx['amount']
+                            if current_total > 20:
+                                now = time.time()
+                                if not alert_timestamps.get(token) or (now - alert_timestamps[token] > ALERT_COOLDOWN_SECONDS):
+                                    if not alerts_triggered:
+                                        print(f"\n🚨 HIGH VOLUME ALERT - {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                                        print("=" * 70)
+                                        alerts_triggered = True
+                                    print(f"💰 {token}: {current_total:.2f} SOL (THRESHOLD EXCEEDED!)")
+                                    desktop_popup("High Volume Buy Alert!", f"{token}: {current_total:.2f} SOL")
+                                    alert_timestamps[token] = now
+                            group_start = tx["time"]
+                            current_total = tx["amount"]
 
-                    if current_group_total > 0:
-                        print(f"  - Token: {token:<10} | Total Buy: {current_group_total:.2f} SOL")
-                        if current_group_total > 20:
-                            now = time.time()
-                            if not alert_timestamps.get(token) or (now - alert_timestamps[token] > ALERT_COOLDOWN_SECONDS):
-                                print(f"!!! ALERT: High volume buy for {token} !!!")
-                                if DISCORD_WEBHOOK:
-                                    try:
-                                        requests.post(
-                                            DISCORD_WEBHOOK,
-                                            json={"content": f"High Volume Buy — {token}: {current_group_total:.2f} SOL"},
-                                            timeout=8
-                                        )
-                                    except Exception:
-                                        pass
-                                else:
-                                    desktop_popup(
-                                        "High Volume Buy",
-                                        f"{token}: {current_group_total:.2f} SOL (>=20)"
-                                    )
-                                alert_timestamps[token] = now
+                    # final group
+                    if current_total > 20:
+                        now = time.time()
+                        if not alert_timestamps.get(token) or (now - alert_timestamps[token] > ALERT_COOLDOWN_SECONDS):
+                            if not alerts_triggered:
+                                print(f"\n🚨 HIGH VOLUME ALERT - {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                                print("=" * 70)
+                                alerts_triggered = True
+                            print(f"💰 {token}: {current_total:.2f} SOL (THRESHOLD EXCEEDED!)")
+                            desktop_popup("High Volume Buy Alert!", f"{token}: {current_total:.2f} SOL")
+                            alert_timestamps[token] = now
 
-            print("\nWaiting 2 minutes before next refresh...")
-            await page.wait_for_timeout(120000)  # 2 minutes
+                if alerts_triggered:
+                    print("=" * 70)
+                    print("🔄 Returning to quiet monitoring...\n")
+
+            # Sleep 1 minute
+            await page.wait_for_timeout(60000)
 
         await browser.close()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Headless Playwright buy monitor")
+    parser = argparse.ArgumentParser(description="Quiet Playwright buy monitor - only shows 20+ SOL alerts")
     parser.add_argument("--url", type=str, required=True, help="Target wallet URL")
     args = parser.parse_args()
-
     asyncio.run(monitor_buys(args.url))
