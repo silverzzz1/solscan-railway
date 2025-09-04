@@ -47,7 +47,11 @@ def parse_time_ago(time_str: str) -> int:
 
 async def monitor_buys(url: str):
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        # >>> Modified line: add --no-sandbox and --disable-dev-shm-usage <<<
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
         page = await browser.new_page()
         print(f"Navigating to {url}")
         await page.goto(url, timeout=60000)
