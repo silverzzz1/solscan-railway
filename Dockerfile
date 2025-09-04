@@ -5,10 +5,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# bring ALL repo files in (avoids filename mismatch issues)
+# bring all code in
 COPY . /app
 
 ENV PYTHONUNBUFFERED=1
 
-# run YOUR script by its actual name
+# URL is read from env var URL
 CMD ["bash","-lc","python solscan_railway.py --url \"$URL\""]
