@@ -50,8 +50,8 @@ async def monitor_buys(url: str):
 
         await page.goto(url, timeout=60000)
 
-        alert_timestamps = {}
-        ALERT_COOLDOWN_SECONDS = 3600  # 1 hour
+        # FIXED: Simple set to track tokens we've already alerted on
+        alerted_tokens = set()
         cycle_count = 0
 
         while True:
@@ -115,6 +115,10 @@ async def monitor_buys(url: str):
                 any_alert = False
 
                 for token, txs in grouped.items():
+                    # FIXED: Skip if we've already alerted on this token
+                    if token in alerted_tokens:
+                        continue
+
                     txs.sort(key=lambda x: x["time"], reverse=True)
                     if not txs:
                         continue
@@ -127,31 +131,30 @@ async def monitor_buys(url: str):
                             current_total += tx["amount"]
                         else:
                             if current_total > 50:
-                                now = time.time()
-                                if not alert_timestamps.get(token) or (now - alert_timestamps[token] > ALERT_COOLDOWN_SECONDS):
-                                    if not any_alert:
-                                        print(f"\n🚨 HIGH VOLUME ALERT - {time.strftime('%Y-%m-%d %H:%M:%S')}")
-                                        print("=" * 70)
-                                        any_alert = True
-                                    msg = f"💰 {token}: {current_total:.2f} SOL (>=50)"
-                                    print(msg)
-                                    send_discord(f"High Volume Buy — {msg}")
-                                    alert_timestamps[token] = now
+                                if not any_alert:
+                                    print(f"\n🚨 HIGH VOLUME ALERT - {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                                    print("=" * 70)
+                                    any_alert = True
+                                msg = f"💰 {token}: {current_total:.2f} SOL (>=50)"
+                                print(msg)
+                                send_discord(f"High Volume Buy — {msg}")
+                                # FIXED: Add to permanent blacklist
+                                alerted_tokens.add(token)
+                                break  # Don't check other groups for this token
                             group_start = tx["time"]
                             current_total = tx["amount"]
 
-                    # Check final group
-                    if current_total > 50:
-                        now = time.time()
-                        if not alert_timestamps.get(token) or (now - alert_timestamps[token] > ALERT_COOLDOWN_SECONDS):
-                            if not any_alert:
-                                print(f"\n🚨 HIGH VOLUME ALERT - {time.strftime('%Y-%m-%d %H:%M:%S')}")
-                                print("=" * 70)
-                                any_alert = True
-                            msg = f"💰 {token}: {current_total:.2f} SOL (>=50)"
-                            print(msg)
-                            send_discord(f"High Volume Buy — {msg}")
-                            alert_timestamps[token] = now
+                    # Check final group (only if we haven't already alerted)
+                    if token not in alerted_tokens and current_total > 50:
+                        if not any_alert:
+                            print(f"\n🚨 HIGH VOLUME ALERT - {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                            print("=" * 70)
+                            any_alert = True
+                        msg = f"💰 {token}: {current_total:.2f} SOL (>=50)"
+                        print(msg)
+                        send_discord(f"High Volume Buy — {msg}")
+                        # FIXED: Add to permanent blacklist
+                        alerted_tokens.add(token)
 
                 if any_alert:
                     print("=" * 70)
