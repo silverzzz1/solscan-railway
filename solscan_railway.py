@@ -1,4 +1,4 @@
-# Headless Playwright monitor (quiet) — sends Discord alerts for >=20 SOL grouped buys
+# Headless Playwright monitor (quiet) — sends Discord alerts for >=40 SOL grouped buys
 
 import asyncio
 import re
@@ -45,7 +45,7 @@ async def monitor_buys(url: str):
         page = await browser.new_page()
 
         print(f"🚀 Starting quiet monitor for {url}")
-        print("📊 Monitoring for buys over 20 SOL... (quiet until alerts)")
+        print("📊 Monitoring for buys over 40 SOL... (quiet until alerts)")
         print("=" * 70)
 
         await page.goto(url, timeout=60000)
@@ -126,14 +126,14 @@ async def monitor_buys(url: str):
                         if tx["time"] - group_start <= 3:
                             current_total += tx["amount"]
                         else:
-                            if current_total > 20:
+                            if current_total > 40:
                                 now = time.time()
                                 if not alert_timestamps.get(token) or (now - alert_timestamps[token] > ALERT_COOLDOWN_SECONDS):
                                     if not any_alert:
                                         print(f"\n🚨 HIGH VOLUME ALERT - {time.strftime('%Y-%m-%d %H:%M:%S')}")
                                         print("=" * 70)
                                         any_alert = True
-                                    msg = f"💰 {token}: {current_total:.2f} SOL (>=20)"
+                                    msg = f"💰 {token}: {current_total:.2f} SOL (>=40)"
                                     print(msg)
                                     send_discord(f"High Volume Buy — {msg}")
                                     alert_timestamps[token] = now
@@ -141,14 +141,14 @@ async def monitor_buys(url: str):
                             current_total = tx["amount"]
 
                     # Check final group
-                    if current_total > 20:
+                    if current_total > 40:
                         now = time.time()
                         if not alert_timestamps.get(token) or (now - alert_timestamps[token] > ALERT_COOLDOWN_SECONDS):
                             if not any_alert:
                                 print(f"\n🚨 HIGH VOLUME ALERT - {time.strftime('%Y-%m-%d %H:%M:%S')}")
                                 print("=" * 70)
                                 any_alert = True
-                            msg = f"💰 {token}: {current_total:.2f} SOL (>=20)"
+                            msg = f"💰 {token}: {current_total:.2f} SOL (>=40)"
                             print(msg)
                             send_discord(f"High Volume Buy — {msg}")
                             alert_timestamps[token] = now
@@ -163,7 +163,8 @@ async def monitor_buys(url: str):
         await browser.close()
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Quiet Playwright buy monitor - only shows 20+ SOL alerts")
+    parser = argparse.ArgumentParser(description="Quiet Playwright buy monitor - only shows 40+ SOL alerts")
     parser.add_argument("--url", type=str, required=True, help="Target wallet URL")
     args = parser.parse_args()
     asyncio.run(monitor_buys(args.url))
+
