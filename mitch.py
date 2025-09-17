@@ -102,7 +102,9 @@ async def monitor_buys(url: str):
                     time_ago_str = await cells[4].inner_text()
                     minutes_ago = parse_time_ago(time_ago_str)
 
-                    buy_transactions.append({"token": token, "amount": amount, "time": minutes_ago})
+                    # FIXED: Only include transactions from last 4 hours (240 minutes)
+                    if minutes_ago <= 240:
+                        buy_transactions.append({"token": token, "amount": amount, "time": minutes_ago})
                 except Exception:
                     continue
 
