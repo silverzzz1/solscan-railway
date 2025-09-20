@@ -92,12 +92,13 @@ def report_duplicates(tokens):
         print("⚠️ Duplicate thumbnails:", ", ".join(dup_thumbs))
 
 def scan_tokens_on_right_panel(page):
-    found = []
+    found_all = []  # All tokens found
+    found_qualifying = []  # Only tokens meeting MIN_KOL_COUNT
     try:
         try:
             page.wait_for_selector("body", timeout=8000)
         except PWTimeout:
-            return found
+            return found_all, found_qualifying
 
         kol_candidates = page.locator(":text('KOL')").all()
         valid_nodes = []
@@ -109,13 +110,11 @@ def scan_tokens_on_right_panel(page):
             except Exception:
                 continue
 
-        print(f"🔍 KOL elements: {len(valid_nodes)}")
+        print(f"🔍 KOL elements found: {len(valid_nodes)}")
         for node in valid_nodes:
             try:
                 kol_text = (node.inner_text() or "").strip()
                 kol_count = extract_kol_count(kol_text)
-                if kol_count < MIN_KOL_COUNT:
-                    continue
 
                 container = node
                 for _ in range(8):
@@ -136,14 +135,26 @@ def scan_tokens_on_right_panel(page):
                 dev_bought = d.group(1).strip() if d else "Unknown"
                 thumb_id = get_thumbnail_id(container) if container else "no_thumb"
 
-                print(f"   🎯 {token}: {kol_count} KOLs | Cap: {market_cap} | Dev: {dev_bought}")
-                found.append({'name': token, 'kol_count': kol_count, 'market_cap': market_cap,
-                              'dev_bought': dev_bought, 'thumb_id': thumb_id})
+                token_data = {'name': token, 'kol_count': kol_count, 'market_cap': market_cap,
+                             'dev_bought': dev_bought, 'thumb_id': thumb_id}
+                
+                # Add to all tokens list
+                found_all.append(token_data)
+                
+                # Show in logs for every token scanned
+                print(f"   📊 SCANNED: {token} → {kol_count} KOLs | Cap: {market_cap} | Dev: {dev_bought}")
+                
+                # Only add to qualifying list if meets threshold
+                if kol_count >= MIN_KOL_COUNT:
+                    found_qualifying.append(token_data)
+                    print(f"   🎯 QUALIFIES: {token} → {kol_count} KOLs (≥{MIN_KOL_COUNT})")
+
             except Exception:
                 continue
     except Exception as e:
         print(f"❌ Scan error: {e}")
-    return found
+    
+    return found_all, found_qualifying
 
 def main():
     print("="*60)
@@ -171,21 +182,25 @@ def main():
                 try:
                     page.reload(timeout=60000)
                     time.sleep(7)
-                    tokens = scan_tokens_on_right_panel(page)
-                    if tokens:
-                        report_duplicates(tokens)
-                        for t in tokens:
+                    all_tokens, qualifying_tokens = scan_tokens_on_right_panel(page)
+                    
+                    print(f"\n📈 SCAN RESULTS: Found {len(all_tokens)} total tokens, {len(qualifying_tokens)} qualify for alerts")
+                    
+                    if qualifying_tokens:
+                        report_duplicates(qualifying_tokens)
+                        for t in qualifying_tokens:
                             name = t['name']
                             if name.lower() not in alerted:
                                 msg = f"🚨 KOL ALERT — {name}: {t['kol_count']} KOLs | Cap {t['market_cap']} | Dev {t['dev_bought']}"
-                                print(msg)
+                                print(f"🔔 ALERTING: {msg}")
                                 send_discord(msg)
                                 save_alerted_token(name)
                                 alerted.add(name.lower())
                             else:
-                                print(f"  (already alerted) {name}")
+                                print(f"  ✅ (already alerted) {name}")
                     else:
                         print(f"✅ No tokens ≥ {MIN_KOL_COUNT} KOLs this scan")
+                        
                 except Exception as e:
                     print(f"❌ scan loop error: {e}")
                 print(f"💤 Sleeping {SCAN_INTERVAL_SECONDS}s")
