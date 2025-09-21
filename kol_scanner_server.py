@@ -157,8 +157,10 @@ def scan_tokens_on_right_panel(page):
                 continue
 
         print(f"🔍 KOL elements found: {len(valid_nodes)}")
-        print("\n📊 DETAILED SCAN RESULTS:")
-        print("-" * 80)
+        print("\n📊 SCANNING ALL TOKENS (SHOWING SOL AMOUNTS):")
+        print("-" * 90)
+        print("🔥=40+SOL ✅=16+KOL 💧=<40SOL ❌=<16KOL")
+        print("-" * 90)
         
         for node in valid_nodes:
             try:
@@ -196,17 +198,23 @@ def scan_tokens_on_right_panel(page):
                 # Log this scan result to file
                 log_scan_result(token, kol_count, sol_amount, market_cap, dev_bought)
                 
-                # Show detailed scan info for every token
+                # Show detailed scan info for EVERY SINGLE TOKEN - NO QUIET MODE!
                 sol_display = f"{sol_amount:.1f}" if sol_amount > 0 else "0.0"
                 kol_indicator = "✅" if kol_count >= MIN_KOL_COUNT else "❌"
                 sol_indicator = "🔥" if sol_amount >= MIN_SOL_ALERT else "💧"
                 
-                print(f"{kol_indicator}{sol_indicator} {token:15} | {kol_count:2d} KOLs | {sol_display:6s} SOL | {market_cap:15s} | {dev_bought}")
+                print(f"{kol_indicator}{sol_indicator} {token:15} | {kol_count:2d} KOLs | {sol_display:8s} SOL | MC: {market_cap[:12]:12s} | Dev: {dev_bought[:20]}")
+                
+                # ALWAYS show what we're processing - VERBOSE!
+                if sol_amount >= MIN_SOL_ALERT:
+                    print(f"   🚨 HIGH SOL DETECTED: {sol_amount:.1f} SOL!")
+                if kol_count >= MIN_KOL_COUNT:
+                    print(f"   📈 HIGH KOL COUNT: {kol_count} KOLs!")
                 
                 # Only add to qualifying list if meets BOTH thresholds
                 if kol_count >= MIN_KOL_COUNT and sol_amount >= MIN_SOL_ALERT:
                     found_qualifying.append(token_data)
-                    print(f"   🎯 QUALIFIES FOR ALERT: {token} → {kol_count} KOLs + {sol_amount:.1f} SOL")
+                    print(f"   🎯 *** QUALIFIES FOR ALERT *** {token} → {kol_count} KOLs + {sol_amount:.1f} SOL")
 
             except Exception as e:
                 print(f"   ❌ Error processing token: {e}")
@@ -218,12 +226,15 @@ def scan_tokens_on_right_panel(page):
 
 def main():
     print("="*60)
-    print("🚀 CabalSpy KOL Token Scanner (server)")
+    print("🚀 CabalSpy KOL Token Scanner (server) - VERBOSE MODE")
     print(f"URL={CABALSPY_URL}")
     print(f"MIN_KOL_COUNT={MIN_KOL_COUNT}, MIN_SOL_ALERT={MIN_SOL_ALERT}, SCAN_INTERVAL_SECONDS={SCAN_INTERVAL_SECONDS}")
+    print("📊 WILL SHOW ALL TOKENS SCANNED WITH SOL AMOUNTS!")
+    print("🔔 WILL ONLY ALERT FOR 40+ SOL BUYS!")
     alerted = load_alerted_tokens()
     print(f"📝 {len(alerted)} tokens in alert history")
     print(f"📋 Scan results logged to: {SCAN_LOG_FILE}")
+    print("🚫 NO QUIET MODE - SHOWING EVERYTHING!")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -245,11 +256,19 @@ def main():
                     time.sleep(7)
                     all_tokens, qualifying_tokens = scan_tokens_on_right_panel(page)
                     
-                    print(f"\n📈 SCAN SUMMARY:")
+                    print(f"\n📈 SCAN SUMMARY - SCAN #{scan_id}:")
                     print(f"   • Total tokens scanned: {len(all_tokens)}")
                     print(f"   • Tokens ≥ {MIN_KOL_COUNT} KOLs: {len([t for t in all_tokens if t['kol_count'] >= MIN_KOL_COUNT])}")
                     print(f"   • Tokens ≥ {MIN_SOL_ALERT} SOL: {len([t for t in all_tokens if t['sol_amount'] >= MIN_SOL_ALERT])}")
                     print(f"   • Tokens qualifying for alerts: {len(qualifying_tokens)}")
+                    
+                    # Show ALL tokens with their SOL amounts in summary
+                    print(f"\n📋 ALL SCANNED TOKENS THIS ROUND:")
+                    for t in all_tokens:
+                        status = "ALERT SENT" if t['name'].lower() in alerted else "MONITORING"
+                        if t['kol_count'] >= MIN_KOL_COUNT and t['sol_amount'] >= MIN_SOL_ALERT:
+                            status = "🚨 ALERT WORTHY"
+                        print(f"   • {t['name']:15} - {t['kol_count']:2d} KOLs, {t['sol_amount']:6.1f} SOL - {status}")
                     
                     if qualifying_tokens:
                         report_duplicates(qualifying_tokens)
