@@ -89,24 +89,75 @@ def extract_sol_amount(text):
         return 0.0
 
 def extract_token_ticker(container_text):
+    """Improved token name extraction with debug output"""
     lines = [l.strip() for l in container_text.split("\n") if l.strip()]
-    skip = {'KOL', 'MARKET CAP', 'DEV BOUGHT', 'VIEW', 'VISUALIZE',
-            'GMGN','PHOTON','AXIOM','BULLX','PADRE','COPY','TRADE','SPY','WALLET','%','SOL','+','-','WOULD','TRULI'}
-    for line in lines[:8]:
-        up = line.upper()
-        if any(k in up for k in skip): 
+    
+    # Debug: Show what we're working with
+    print(f"DEBUG - Raw container text (first 200 chars): {repr(container_text[:200])}")
+    
+    # More flexible skip terms - only skip obvious UI elements
+    skip = {'KOL', 'MARKET CAP', 'DEV BOUGHT', 'VIEW', 'VISUALIZE', 'GMGN', 'PHOTON', 'AXIOM', 'BULLX', 'PADRE', 'COPY', 'TRADE', 'SPY', 'WALLET'}
+    
+    print(f"DEBUG - Processing {len(lines)} lines")
+    for i, line in enumerate(lines[:15]):  # Show first 15 lines
+        print(f"  Line {i}: {repr(line)}")
+    
+    # First pass - look for token-like strings in first 10 lines
+    for i, line in enumerate(lines[:10]):
+        print(f"DEBUG - Checking line {i}: {repr(line)}")
+        
+        # Skip obvious numbers/percentages
+        if re.match(r"^[\d.+\-$%\s,]+$", line):
+            print(f"  -> Skipped (numbers/symbols only)")
             continue
-        if re.match(r"^[\d.+\-$%\s]+$", line): 
+        
+        # Skip known UI elements
+        if any(skip_term in line.upper() for skip_term in skip):
+            print(f"  -> Skipped (contains UI element)")
             continue
-        if 2 <= len(line) <= 20:
+        
+        # Skip lines that are too short or too long
+        if len(line) < 2 or len(line) > 25:
+            print(f"  -> Skipped (length {len(line)})")
+            continue
+        
+        # Look for reasonable token names (alphanumeric + some symbols)
+        if re.match(r"^[A-Za-z0-9$_.@#&!?*+-]+$", line):
+            print(f"  -> FOUND TOKEN: {line}")
             return line
+        
+        # Look for $SYMBOL format
+        dollar_match = re.search(r"\$([A-Za-z0-9_]{2,15})", line)
+        if dollar_match:
+            token = dollar_match.group(1)
+            print(f"  -> FOUND $TOKEN: {token}")
+            return token
+        
+        # Look for words that end with common token patterns
+        token_patterns = [
+            r"\b([A-Z]{2,8})\b",  # All caps 2-8 chars
+            r"\b([A-Za-z]{2,15})(?=\s|$)",  # Word at end of line
+            r"([A-Za-z0-9]{3,15})(?=\s*\()"  # Before parentheses
+        ]
+        
+        for pattern in token_patterns:
+            matches = re.findall(pattern, line)
+            for match in matches:
+                if match.upper() not in skip and len(match) >= 2:
+                    print(f"  -> FOUND PATTERN TOKEN: {match}")
+                    return match
+    
+    # Second pass - broader search if nothing found
+    print("DEBUG - First pass failed, trying broader search...")
     for line in lines:
-        for pat in [r"\b[A-Z]{3,8}\b", r"\$([A-Za-z]{2,10})\b", r"\b([A-Za-z]{2,15})\s*\("]:
-            m = re.findall(pat, line)
-            for tok in m:
-                tok = tok if isinstance(tok, str) else tok
-                if tok and tok.upper() not in skip:
-                    return tok
+        # Look for standalone words that could be tokens
+        words = re.findall(r"\b[A-Za-z][A-Za-z0-9_]{1,20}\b", line)
+        for word in words:
+            if word.upper() not in skip and len(word) >= 2:
+                print(f"DEBUG - Found fallback token: {word}")
+                return word
+    
+    print("DEBUG - No token found, returning UNKNOWN_TOKEN")
     return "UNKNOWN_TOKEN"
 
 def get_thumbnail_id(container):
@@ -178,6 +229,8 @@ def scan_tokens_on_right_panel(page):
                         break
 
                 container_text = container.inner_text() if container else ""
+                
+                print(f"\n=== PROCESSING TOKEN {len(found_all) + 1} ===")
                 token = extract_token_ticker(container_text)
 
                 # Extract SOL amount from container text
@@ -226,11 +279,12 @@ def scan_tokens_on_right_panel(page):
 
 def main():
     print("="*60)
-    print("🚀 CabalSpy KOL Token Scanner (server) - VERBOSE MODE")
+    print("🚀 CabalSpy KOL Token Scanner (server) - VERBOSE MODE + DEBUG")
     print(f"URL={CABALSPY_URL}")
     print(f"MIN_KOL_COUNT={MIN_KOL_COUNT}, MIN_SOL_ALERT={MIN_SOL_ALERT}, SCAN_INTERVAL_SECONDS={SCAN_INTERVAL_SECONDS}")
     print("📊 WILL SHOW ALL TOKENS SCANNED WITH SOL AMOUNTS!")
     print("🔔 WILL ONLY ALERT FOR 40+ SOL BUYS!")
+    print("🐛 DEBUG MODE ENABLED - SHOWING TOKEN EXTRACTION PROCESS!")
     alerted = load_alerted_tokens()
     print(f"📝 {len(alerted)} tokens in alert history")
     print(f"📋 Scan results logged to: {SCAN_LOG_FILE}")
@@ -261,6 +315,7 @@ def main():
                     print(f"   • Tokens ≥ {MIN_KOL_COUNT} KOLs: {len([t for t in all_tokens if t['kol_count'] >= MIN_KOL_COUNT])}")
                     print(f"   • Tokens ≥ {MIN_SOL_ALERT} SOL: {len([t for t in all_tokens if t['sol_amount'] >= MIN_SOL_ALERT])}")
                     print(f"   • Tokens qualifying for alerts: {len(qualifying_tokens)}")
+                    print(f"   • UNKNOWN_TOKEN count: {len([t for t in all_tokens if t['name'] == 'UNKNOWN_TOKEN'])}")
                     
                     # Show ALL tokens with their SOL amounts in summary
                     print(f"\n📋 ALL SCANNED TOKENS THIS ROUND:")
