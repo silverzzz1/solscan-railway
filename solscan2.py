@@ -89,75 +89,51 @@ def extract_sol_amount(text):
         return 0.0
 
 def extract_token_ticker(container_text):
-    """Improved token name extraction with debug output"""
-    lines = [l.strip() for l in container_text.split("\n") if l.strip()]
-    
-    # Debug: Show what we're working with
+    """Improved token ticker extraction with debug output."""
     print(f"DEBUG - Raw container text (first 200 chars): {repr(container_text[:200])}")
     
-    # More flexible skip terms - only skip obvious UI elements
-    skip = {'KOL', 'MARKET CAP', 'DEV BOUGHT', 'VIEW', 'VISUALIZE', 'GMGN', 'PHOTON', 'AXIOM', 'BULLX', 'PADRE', 'COPY', 'TRADE', 'SPY', 'WALLET'}
-    
-    print(f"DEBUG - Processing {len(lines)} lines")
-    for i, line in enumerate(lines[:15]):  # Show first 15 lines
+    # These are specific UI text elements on the site to ignore.
+    skip_keywords = {
+        'KOL', 'KOLS', 'MARKET CAP', 'DEV BOUGHT', 'VIEW', 'VISUALIZE',
+        'GMGN', 'PHOTON', 'AXIOM', 'BULLX', 'PADRE', 'COPY', 'TRADE', 'SPY', 'WALLET'
+    }
+
+    lines = [line.strip() for line in container_text.split('\n') if line.strip()]
+    print(f"DEBUG - Processing {len(lines)} lines...")
+
+    # Iterate through the first few lines, where the token name is expected.
+    for i, line in enumerate(lines[:10]): # Check first 10 lines
         print(f"  Line {i}: {repr(line)}")
-    
-    # First pass - look for token-like strings in first 10 lines
-    for i, line in enumerate(lines[:10]):
-        print(f"DEBUG - Checking line {i}: {repr(line)}")
         
-        # Skip obvious numbers/percentages
-        if re.match(r"^[\d.+\-$%\s,]+$", line):
-            print(f"  -> Skipped (numbers/symbols only)")
+        # Rule 1: Check if the line is an exact match for a keyword to skip.
+        if line.upper() in skip_keywords:
+            print(f"   -> Skipped (UI keyword)")
             continue
-        
-        # Skip known UI elements
-        if any(skip_term in line.upper() for skip_term in skip):
-            print(f"  -> Skipped (contains UI element)")
+
+        # Rule 2: Check if the line is purely numeric or symbolic (e.g., price, percentage).
+        if re.fullmatch(r'[\d,.$%+\-/\s]+', line):
+            print(f"   -> Skipped (Numeric/Symbolic)")
             continue
-        
-        # Skip lines that are too short or too long
-        if len(line) < 2 or len(line) > 25:
-            print(f"  -> Skipped (length {len(line)})")
+            
+        # Rule 3: Skip wallet addresses or other long strings.
+        if len(line) > 30:
+            print(f"   -> Skipped (Too long)")
             continue
-        
-        # Look for reasonable token names (alphanumeric + some symbols)
-        if re.match(r"^[A-Za-z0-9$_.@#&!?*+-]+$", line):
-            print(f"  -> FOUND TOKEN: {line}")
+
+        # Rule 4: A plausible token name has a reasonable length and contains at least one letter.
+        if 2 <= len(line) <= 25 and any(c.isalpha() for c in line):
+            print(f"   -> FOUND TOKEN: {line}")
             return line
-        
-        # Look for $SYMBOL format
-        dollar_match = re.search(r"\$([A-Za-z0-9_]{2,15})", line)
+
+    print("DEBUG - Primary logic failed, trying fallback search for $TICKER...")
+    for line in lines:
+        dollar_match = re.search(r'\$([A-Za-z0-9_]{2,15})', line)
         if dollar_match:
             token = dollar_match.group(1)
             print(f"  -> FOUND $TOKEN: {token}")
             return token
-        
-        # Look for words that end with common token patterns
-        token_patterns = [
-            r"\b([A-Z]{2,8})\b",  # All caps 2-8 chars
-            r"\b([A-Za-z]{2,15})(?=\s|$)",  # Word at end of line
-            r"([A-Za-z0-9]{3,15})(?=\s*\()"  # Before parentheses
-        ]
-        
-        for pattern in token_patterns:
-            matches = re.findall(pattern, line)
-            for match in matches:
-                if match.upper() not in skip and len(match) >= 2:
-                    print(f"  -> FOUND PATTERN TOKEN: {match}")
-                    return match
-    
-    # Second pass - broader search if nothing found
-    print("DEBUG - First pass failed, trying broader search...")
-    for line in lines:
-        # Look for standalone words that could be tokens
-        words = re.findall(r"\b[A-Za-z][A-Za-z0-9_]{1,20}\b", line)
-        for word in words:
-            if word.upper() not in skip and len(word) >= 2:
-                print(f"DEBUG - Found fallback token: {word}")
-                return word
-    
-    print("DEBUG - No token found, returning UNKNOWN_TOKEN")
+
+    print("DEBUG - No token found. Returning UNKNOWN_TOKEN.")
     return "UNKNOWN_TOKEN"
 
 def get_thumbnail_id(container):
@@ -243,7 +219,7 @@ def scan_tokens_on_right_panel(page):
                 thumb_id = get_thumbnail_id(container) if container else "no_thumb"
 
                 token_data = {'name': token, 'kol_count': kol_count, 'sol_amount': sol_amount, 
-                             'market_cap': market_cap, 'dev_bought': dev_bought, 'thumb_id': thumb_id}
+                              'market_cap': market_cap, 'dev_bought': dev_bought, 'thumb_id': thumb_id}
                 
                 # Add to all tokens list
                 found_all.append(token_data)
@@ -260,17 +236,17 @@ def scan_tokens_on_right_panel(page):
                 
                 # ALWAYS show what we're processing - VERBOSE!
                 if sol_amount >= MIN_SOL_ALERT:
-                    print(f"   🚨 HIGH SOL DETECTED: {sol_amount:.1f} SOL!")
+                    print(f"    🚨 HIGH SOL DETECTED: {sol_amount:.1f} SOL!")
                 if kol_count >= MIN_KOL_COUNT:
-                    print(f"   📈 HIGH KOL COUNT: {kol_count} KOLs!")
+                    print(f"    📈 HIGH KOL COUNT: {kol_count} KOLs!")
                 
                 # Only add to qualifying list if meets BOTH thresholds
                 if kol_count >= MIN_KOL_COUNT and sol_amount >= MIN_SOL_ALERT:
                     found_qualifying.append(token_data)
-                    print(f"   🎯 *** QUALIFIES FOR ALERT *** {token} → {kol_count} KOLs + {sol_amount:.1f} SOL")
+                    print(f"    🎯 *** QUALIFIES FOR ALERT *** {token} → {kol_count} KOLs + {sol_amount:.1f} SOL")
 
             except Exception as e:
-                print(f"   ❌ Error processing token: {e}")
+                print(f"    ❌ Error processing token: {e}")
                 continue
     except Exception as e:
         print(f"❌ Scan error: {e}")
@@ -311,19 +287,21 @@ def main():
                     all_tokens, qualifying_tokens = scan_tokens_on_right_panel(page)
                     
                     print(f"\n📈 SCAN SUMMARY - SCAN #{scan_id}:")
-                    print(f"   • Total tokens scanned: {len(all_tokens)}")
-                    print(f"   • Tokens ≥ {MIN_KOL_COUNT} KOLs: {len([t for t in all_tokens if t['kol_count'] >= MIN_KOL_COUNT])}")
-                    print(f"   • Tokens ≥ {MIN_SOL_ALERT} SOL: {len([t for t in all_tokens if t['sol_amount'] >= MIN_SOL_ALERT])}")
-                    print(f"   • Tokens qualifying for alerts: {len(qualifying_tokens)}")
-                    print(f"   • UNKNOWN_TOKEN count: {len([t for t in all_tokens if t['name'] == 'UNKNOWN_TOKEN'])}")
+                    print(f"    • Total tokens scanned: {len(all_tokens)}")
+                    print(f"    • Tokens ≥ {MIN_KOL_COUNT} KOLs: {len([t for t in all_tokens if t['kol_count'] >= MIN_KOL_COUNT])}")
+                    print(f"    • Tokens ≥ {MIN_SOL_ALERT} SOL: {len([t for t in all_tokens if t['sol_amount'] >= MIN_SOL_ALERT])}")
+                    print(f"    • Tokens qualifying for alerts: {len(qualifying_tokens)}")
+                    print(f"    • UNKNOWN_TOKEN count: {len([t for t in all_tokens if t['name'] == 'UNKNOWN_TOKEN'])}")
                     
                     # Show ALL tokens with their SOL amounts in summary
                     print(f"\n📋 ALL SCANNED TOKENS THIS ROUND:")
                     for t in all_tokens:
-                        status = "ALERT SENT" if t['name'].lower() in alerted else "MONITORING"
-                        if t['kol_count'] >= MIN_KOL_COUNT and t['sol_amount'] >= MIN_SOL_ALERT:
+                        status = "MONITORING"
+                        if t['name'].lower() in alerted:
+                            status = "ALERT SENT"
+                        elif t['kol_count'] >= MIN_KOL_COUNT and t['sol_amount'] >= MIN_SOL_ALERT:
                             status = "🚨 ALERT WORTHY"
-                        print(f"   • {t['name']:15} - {t['kol_count']:2d} KOLs, {t['sol_amount']:6.1f} SOL - {status}")
+                        print(f"    • {t['name']:15} - {t['kol_count']:2d} KOLs, {t['sol_amount']:6.1f} SOL - {status}")
                     
                     if qualifying_tokens:
                         report_duplicates(qualifying_tokens)
