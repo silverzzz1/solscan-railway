@@ -1,330 +1,187 @@
-# kol_scanner_server.py
-# CabalSpy KOL token scanner (server-safe). Sends Discord alerts; no GUI.
+# solscan_playwright.py
+# Headless Playwright script to monitor buy transactions on CabalSpy
+# QUIET MODE: Only shows output when finding coins over 20 SOL
 
-import time, re, os
-from collections import Counter
-import requests
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+import asyncio
+import re
+import time
+import argparse
+from collections import defaultdict
+from playwright.async_api import async_playwright
+from playwright.async_api import TimeoutError as PWTimeoutError
 
-# --- Config via env ---
-CABALSPY_URL = os.getenv("CABALSPY_URL", "https://cabalspy.xyz/dashboard.php")
-SCAN_INTERVAL_SECONDS = int(os.getenv("SCAN_INTERVAL_SECONDS", "160"))
-MIN_KOL_COUNT = int(os.getenv("MIN_KOL_COUNT", "16"))
-MIN_SOL_ALERT = float(os.getenv("MIN_SOL_ALERT", "40.0"))  # Only alert for 40+ SOL
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "").strip()
+# Desktop popup for Windows
+import threading, ctypes
+def desktop_popup(title: str, message: str):
+    def _show():
+        try:
+            # 0x00001040 = MB_OK | MB_ICONINFORMATION
+            ctypes.windll.user32.MessageBoxW(0, message, title, 0x00001040)
+        except Exception:
+            pass
+    threading.Thread(target=_show, daemon=True).start()
 
-# Data dir for alert history
-DATA_DIR = os.getenv("DATA_DIR", "/app/data")
-os.makedirs(DATA_DIR, exist_ok=True)
-ALERT_FILE = os.path.join(DATA_DIR, "alerted_tokens.txt")
-SCAN_LOG_FILE = os.path.join(DATA_DIR, "scan_history.txt")
-
-def send_discord(msg: str):
-    if not DISCORD_WEBHOOK:
-        return
-    try:
-        requests.post(DISCORD_WEBHOOK, json={"content": msg}, timeout=8)
-    except Exception:
-        pass
-
-def load_alerted_tokens():
-    if not os.path.exists(ALERT_FILE):
-        return set()
-    with open(ALERT_FILE, "r") as f:
-        return {line.strip().lower() for line in f}
-
-def save_alerted_token(token_name):
-    with open(ALERT_FILE, "a") as f:
-        f.write(f"{token_name.lower()}\n")
-
-def log_scan_result(token_name, kol_count, sol_amount, market_cap, dev_bought):
-    """Log all scanned tokens to file for record keeping"""
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    log_entry = f"[{timestamp}] {token_name} | {kol_count} KOLs | {sol_amount} SOL | Cap: {market_cap} | Dev: {dev_bought}\n"
-    try:
-        with open(SCAN_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(log_entry)
-    except Exception:
-        pass
-
-def extract_kol_count(kol_text):
-    try:
-        m = re.search(r"(\d+)\s*KOLs?", kol_text, re.IGNORECASE)
-        return int(m.group(1)) if m else 0
-    except:
+def parse_time_ago(time_str: str) -> int:
+    """
+    Converts strings like "1m ago", "5s ago", "2h ago" into minutes.
+    """
+    if not time_str:
+        return 999
+    numbers = re.findall(r'\d+', time_str)
+    if not numbers:
+        return 999
+    value = int(numbers[0])
+    if 's' in time_str:
         return 0
+    if 'm' in time_str:
+        return value
+    if 'h' in time_str:
+        return value * 60
+    if 'd' in time_str:
+        return value * 1440
+    return value
 
-def extract_sol_amount(text):
-    """Extract SOL amount from various text formats"""
-    try:
-        # Look for patterns like "12.5 SOL", "45SOL", "SOL 23.8", etc.
-        patterns = [
-            r"(\d+\.?\d*)\s*SOL",  # "12.5 SOL" or "45SOL"
-            r"SOL\s*(\d+\.?\d*)",  # "SOL 12.5"
-            r"(\d+\.?\d*)\s*sol",  # lowercase variants
-            r"sol\s*(\d+\.?\d*)"
-        ]
+async def monitor_buys(url: str):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
         
-        for pattern in patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            if matches:
-                # Return the largest SOL amount found
-                amounts = [float(m) for m in matches if m]
-                if amounts:
-                    return max(amounts)
+        # Only show initial startup message
+        print(f"🚀 Starting quiet monitor for {url}")
+        print("📊 Monitoring for buys over 20 SOL... (terminal will stay quiet until alerts)")
+        print("=" * 70)
         
-        # If no SOL found, try to extract from dev bought field
-        dev_match = re.search(r"Dev Bought[:\s]*([^\n]+)", text, re.IGNORECASE)
-        if dev_match:
-            dev_text = dev_match.group(1)
-            for pattern in patterns:
-                matches = re.findall(pattern, dev_text, re.IGNORECASE)
-                if matches:
-                    amounts = [float(m) for m in matches if m]
-                    if amounts:
-                        return max(amounts)
-        
-        return 0.0
-    except Exception:
-        return 0.0
+        await page.goto(url, timeout=60000)
 
-def extract_token_ticker(container_text):
-    """Improved token ticker extraction with debug output."""
-    print(f"DEBUG - Raw container text (first 200 chars): {repr(container_text[:200])}")
-    
-    # These are specific UI text elements on the site to ignore.
-    skip_keywords = {
-        'KOL', 'KOLS', 'MARKET CAP', 'DEV BOUGHT', 'VIEW', 'VISUALIZE',
-        'GMGN', 'PHOTON', 'AXIOM', 'BULLX', 'PADRE', 'COPY', 'TRADE', 'SPY', 'WALLET'
-    }
+        alert_timestamps = {}
+        ALERT_COOLDOWN_SECONDS = 3600  # 1 hour
+        cycle_count = 0
 
-    lines = [line.strip() for line in container_text.split('\n') if line.strip()]
-    print(f"DEBUG - Processing {len(lines)} lines...")
-
-    # Iterate through the first few lines, where the token name is expected.
-    for i, line in enumerate(lines[:10]): # Check first 10 lines
-        print(f"  Line {i}: {repr(line)}")
-        
-        # Rule 1: Check if the line is an exact match for a keyword to skip.
-        if line.upper() in skip_keywords:
-            print(f"   -> Skipped (UI keyword)")
-            continue
-
-        # Rule 2: Check if the line is purely numeric or symbolic (e.g., price, percentage).
-        if re.fullmatch(r'[\d,.$%+\-/\s]+', line):
-            print(f"   -> Skipped (Numeric/Symbolic)")
-            continue
+        while True:
+            cycle_count += 1
             
-        # Rule 3: Skip wallet addresses or other long strings.
-        if len(line) > 30:
-            print(f"   -> Skipped (Too long)")
-            continue
+            # Show a simple "alive" indicator every 10 cycles (10 minutes)
+            if cycle_count % 10 == 0:
+                print(f"⏰ Still monitoring... ({cycle_count} checks completed)")
 
-        # Rule 4: A plausible token name has a reasonable length and contains at least one letter.
-        if 2 <= len(line) <= 25 and any(c.isalpha() for c in line):
-            print(f"   -> FOUND TOKEN: {line}")
-            return line
-
-    print("DEBUG - Primary logic failed, trying fallback search for $TICKER...")
-    for line in lines:
-        dollar_match = re.search(r'\$([A-Za-z0-9_]{2,15})', line)
-        if dollar_match:
-            token = dollar_match.group(1)
-            print(f"  -> FOUND $TOKEN: {token}")
-            return token
-
-    print("DEBUG - No token found. Returning UNKNOWN_TOKEN.")
-    return "UNKNOWN_TOKEN"
-
-def get_thumbnail_id(container):
-    try:
-        for img in container.query_selector_all("img"):
-            src = (img.get_attribute("src") or "").strip()
-            if src: 
-                return src.lower()
-    except Exception:
-        pass
-    try:
-        for node in container.query_selector_all("[style*='background-image']"):
-            bg = (node.get_attribute("style") or "")
-            m = re.search(r"background-image\s*:\s*url\(([^)]+)\)", bg, re.IGNORECASE)
-            if m:
-                return m.group(1).strip('\'" ').lower()
-    except Exception:
-        pass
-    return "no_thumb"
-
-def report_duplicates(tokens):
-    name_counts = Counter([t['name'].strip().lower() for t in tokens if t['name'] and t['name'] != "UNKNOWN_TOKEN"])
-    thumb_counts = Counter([t.get('thumb_id', 'no_thumb') for t in tokens])
-    dup_names = [n for n,c in name_counts.items() if c>1]
-    dup_thumbs = [h for h,c in thumb_counts.items() if h!="no_thumb" and c>1]
-    if dup_names:
-        print("⚠️ Duplicate token names:", ", ".join(dup_names))
-    if dup_thumbs:
-        print("⚠️ Duplicate thumbnails:", ", ".join(dup_thumbs))
-
-def scan_tokens_on_right_panel(page):
-    found_all = []  # All tokens found
-    found_qualifying = []  # Only tokens meeting MIN_KOL_COUNT and SOL requirements
-    try:
-        try:
-            page.wait_for_selector("body", timeout=8000)
-        except PWTimeout:
-            return found_all, found_qualifying
-
-        kol_candidates = page.locator(":text('KOL')").all()
-        valid_nodes = []
-        for node in kol_candidates:
+            # Reload page quietly
             try:
-                txt = (node.inner_text() or "").strip()
-                if re.search(r"\d+\s*KOLs?", txt, re.IGNORECASE):
-                    valid_nodes.append(node)
-            except Exception:
-                continue
-
-        print(f"🔍 KOL elements found: {len(valid_nodes)}")
-        print("\n📊 SCANNING ALL TOKENS (SHOWING SOL AMOUNTS):")
-        print("-" * 90)
-        print("🔥=40+SOL ✅=16+KOL 💧=<40SOL ❌=<16KOL")
-        print("-" * 90)
-        
-        for node in valid_nodes:
-            try:
-                kol_text = (node.inner_text() or "").strip()
-                kol_count = extract_kol_count(kol_text)
-
-                container = node
-                for _ in range(8):
-                    txt = (container.inner_text() or "")
-                    if any(s in txt for s in ['Market Cap','Dev Bought','VISUALIZE','VIEW']):
-                        break
-                    parent = container.evaluate_handle("el => el.parentElement")
-                    container = parent.as_element() if parent else container
-                    if container is None:
-                        break
-
-                container_text = container.inner_text() if container else ""
-                
-                print(f"\n=== PROCESSING TOKEN {len(found_all) + 1} ===")
-                token = extract_token_ticker(container_text)
-
-                # Extract SOL amount from container text
-                sol_amount = extract_sol_amount(container_text)
-
-                m = re.search(r"Market Cap[:\s]*([^\n]+)", container_text)
-                market_cap = m.group(1).strip() if m else "Unknown"
-                d = re.search(r"Dev Bought[:\s]*([^\n]+)", container_text)
-                dev_bought = d.group(1).strip() if d else "Unknown"
-                thumb_id = get_thumbnail_id(container) if container else "no_thumb"
-
-                token_data = {'name': token, 'kol_count': kol_count, 'sol_amount': sol_amount, 
-                              'market_cap': market_cap, 'dev_bought': dev_bought, 'thumb_id': thumb_id}
-                
-                # Add to all tokens list
-                found_all.append(token_data)
-                
-                # Log this scan result to file
-                log_scan_result(token, kol_count, sol_amount, market_cap, dev_bought)
-                
-                # Show detailed scan info for EVERY SINGLE TOKEN - NO QUIET MODE!
-                sol_display = f"{sol_amount:.1f}" if sol_amount > 0 else "0.0"
-                kol_indicator = "✅" if kol_count >= MIN_KOL_COUNT else "❌"
-                sol_indicator = "🔥" if sol_amount >= MIN_SOL_ALERT else "💧"
-                
-                print(f"{kol_indicator}{sol_indicator} {token:15} | {kol_count:2d} KOLs | {sol_display:8s} SOL | MC: {market_cap[:12]:12s} | Dev: {dev_bought[:20]}")
-                
-                # ALWAYS show what we're processing - VERBOSE!
-                if sol_amount >= MIN_SOL_ALERT:
-                    print(f"    🚨 HIGH SOL DETECTED: {sol_amount:.1f} SOL!")
-                if kol_count >= MIN_KOL_COUNT:
-                    print(f"    📈 HIGH KOL COUNT: {kol_count} KOLs!")
-                
-                # Only add to qualifying list if meets BOTH thresholds
-                if kol_count >= MIN_KOL_COUNT and sol_amount >= MIN_SOL_ALERT:
-                    found_qualifying.append(token_data)
-                    print(f"    🎯 *** QUALIFIES FOR ALERT *** {token} → {kol_count} KOLs + {sol_amount:.1f} SOL")
-
-            except Exception as e:
-                print(f"    ❌ Error processing token: {e}")
-                continue
-    except Exception as e:
-        print(f"❌ Scan error: {e}")
-    
-    return found_all, found_qualifying
-
-def main():
-    print("="*60)
-    print("🚀 CabalSpy KOL Token Scanner (server) - VERBOSE MODE + DEBUG")
-    print(f"URL={CABALSPY_URL}")
-    print(f"MIN_KOL_COUNT={MIN_KOL_COUNT}, MIN_SOL_ALERT={MIN_SOL_ALERT}, SCAN_INTERVAL_SECONDS={SCAN_INTERVAL_SECONDS}")
-    print("📊 WILL SHOW ALL TOKENS SCANNED WITH SOL AMOUNTS!")
-    print("🔔 WILL ONLY ALERT FOR 40+ SOL BUYS!")
-    print("🐛 DEBUG MODE ENABLED - SHOWING TOKEN EXTRACTION PROCESS!")
-    alerted = load_alerted_tokens()
-    print(f"📝 {len(alerted)} tokens in alert history")
-    print(f"📋 Scan results logged to: {SCAN_LOG_FILE}")
-    print("🚫 NO QUIET MODE - SHOWING EVERYTHING!")
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
-        )
-        page = browser.new_page()
-        try:
-            print(f"🌐 Opening {CABALSPY_URL}")
-            page.goto(CABALSPY_URL, timeout=60000)
-            time.sleep(5)
-            scan_id = 0
-            while True:
-                scan_id += 1
-                print("\n" + "="*60)
-                print(f"🔎 Scan #{scan_id} - {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                await page.reload(wait_until="domcontentloaded", timeout=60000)
+            except PWTimeoutError:
+                # Silent recovery attempts
                 try:
-                    page.reload(timeout=60000)
-                    time.sleep(7)
-                    all_tokens, qualifying_tokens = scan_tokens_on_right_panel(page)
-                    
-                    print(f"\n📈 SCAN SUMMARY - SCAN #{scan_id}:")
-                    print(f"    • Total tokens scanned: {len(all_tokens)}")
-                    print(f"    • Tokens ≥ {MIN_KOL_COUNT} KOLs: {len([t for t in all_tokens if t['kol_count'] >= MIN_KOL_COUNT])}")
-                    print(f"    • Tokens ≥ {MIN_SOL_ALERT} SOL: {len([t for t in all_tokens if t['sol_amount'] >= MIN_SOL_ALERT])}")
-                    print(f"    • Tokens qualifying for alerts: {len(qualifying_tokens)}")
-                    print(f"    • UNKNOWN_TOKEN count: {len([t for t in all_tokens if t['name'] == 'UNKNOWN_TOKEN'])}")
-                    
-                    # Show ALL tokens with their SOL amounts in summary
-                    print(f"\n📋 ALL SCANNED TOKENS THIS ROUND:")
-                    for t in all_tokens:
-                        status = "MONITORING"
-                        if t['name'].lower() in alerted:
-                            status = "ALERT SENT"
-                        elif t['kol_count'] >= MIN_KOL_COUNT and t['sol_amount'] >= MIN_SOL_ALERT:
-                            status = "🚨 ALERT WORTHY"
-                        print(f"    • {t['name']:15} - {t['kol_count']:2d} KOLs, {t['sol_amount']:6.1f} SOL - {status}")
-                    
-                    if qualifying_tokens:
-                        report_duplicates(qualifying_tokens)
-                        for t in qualifying_tokens:
-                            name = t['name']
-                            if name.lower() not in alerted:
-                                msg = f"🚨 MAJOR KOL ALERT — {name}: {t['kol_count']} KOLs + {t['sol_amount']:.1f} SOL | Cap {t['market_cap']} | Dev {t['dev_bought']}"
-                                print(f"🔔 SENDING ALERT: {msg}")
-                                send_discord(msg)
-                                save_alerted_token(name)
-                                alerted.add(name.lower())
-                            else:
-                                print(f"  ✅ (already alerted) {name}")
-                    else:
-                        print(f"✅ No tokens meet BOTH criteria (≥{MIN_KOL_COUNT} KOLs AND ≥{MIN_SOL_ALERT} SOL)")
-                        
-                except Exception as e:
-                    print(f"❌ scan loop error: {e}")
-                print(f"💤 Sleeping {SCAN_INTERVAL_SECONDS}s")
-                time.sleep(SCAN_INTERVAL_SECONDS)
-        finally:
-            try: browser.close()
-            except: pass
+                    await page.evaluate("location.reload()")
+                    await page.wait_for_load_state("domcontentloaded", timeout=60000)
+                except Exception:
+                    try:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    except Exception:
+                        # Only show error if it's persistent
+                        if cycle_count % 5 == 0:  # Show error every 5 failed attempts
+                            print(f"⚠️  Connection issues detected (attempt {cycle_count})")
+                        await page.wait_for_timeout(5000)
+                        continue
+
+            await page.wait_for_timeout(4000)
+
+            try:
+                table = await page.query_selector("#transactions-table")
+                rows = await table.query_selector_all("tr")
+            except Exception:
+                # Silent continue - don't spam about missing table
+                continue
+
+            buy_transactions = []
+            for row in rows:
+                try:
+                    if not await row.query_selector(".buy-text"):
+                        continue
+
+                    cells = await row.query_selector_all("td")
+                    if len(cells) < 5:
+                        continue
+
+                    token_name = (await cells[1].inner_text()).strip().upper()
+                    amount_str = (await cells[3].inner_text()).replace(" SOL", "").replace(",", ".")
+                    amount = float(amount_str)
+                    time_ago_str = await cells[4].inner_text()
+                    minutes_ago = parse_time_ago(time_ago_str)
+
+                    buy_transactions.append({
+                        "token": token_name,
+                        "amount": amount,
+                        "time": minutes_ago
+                    })
+                except Exception:
+                    continue
+
+            # Only process and show output if we have transactions
+            if buy_transactions:
+                grouped_by_token = defaultdict(list)
+                for tx in buy_transactions:
+                    grouped_by_token[tx['token']].append(tx)
+
+                # Only show alerts for high volume buys
+                alerts_triggered = False
+                
+                for token, transactions in grouped_by_token.items():
+                    transactions.sort(key=lambda x: x['time'], reverse=True)
+                    if not transactions:
+                        continue
+
+                    current_group_total = 0
+                    group_start_time = transactions[0]['time']
+
+                    for tx in transactions:
+                        if tx['time'] - group_start_time <= 3:
+                            current_group_total += tx['amount']
+                        else:
+                            if current_group_total > 20:
+                                now = time.time()
+                                if not alert_timestamps.get(token) or (now - alert_timestamps[token] > ALERT_COOLDOWN_SECONDS):
+                                    if not alerts_triggered:
+                                        print(f"\n🚨 HIGH VOLUME ALERT - {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                                        print("=" * 70)
+                                        alerts_triggered = True
+                                    
+                                    print(f"💰 {token}: {current_group_total:.2f} SOL (THRESHOLD EXCEEDED!)")
+                                    desktop_popup(
+                                        "High Volume Buy Alert!",
+                                        f"{token}: {current_group_total:.2f} SOL"
+                                    )
+                                    alert_timestamps[token] = now
+                            
+                            group_start_time = tx['time']
+                            current_group_total = tx['amount']
+
+                    # Check final group
+                    if current_group_total > 20:
+                        now = time.time()
+                        if not alert_timestamps.get(token) or (now - alert_timestamps[token] > ALERT_COOLDOWN_SECONDS):
+                            if not alerts_triggered:
+                                print(f"\n🚨 HIGH VOLUME ALERT - {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                                print("=" * 70)
+                                alerts_triggered = True
+                            
+                            print(f"💰 {token}: {current_group_total:.2f} SOL (THRESHOLD EXCEEDED!)")
+                            desktop_popup(
+                                "High Volume Buy Alert!",
+                                f"{token}: {current_group_total:.2f} SOL"
+                            )
+                            alert_timestamps[token] = now
+
+                if alerts_triggered:
+                    print("=" * 70)
+                    print("🔄 Returning to quiet monitoring...\n")
+
+            # Wait 1 minute silently
+            await page.wait_for_timeout(60000)
+
+        await browser.close()
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Quiet Playwright buy monitor - only shows 20+ SOL alerts")
+    parser.add_argument("--url", type=str, required=True, help="Target wallet URL")
+    args = parser.parse_args()
+
+    asyncio.run(monitor_buys(args.url))
