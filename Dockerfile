@@ -1,14 +1,18 @@
-FROM mcr.microsoft.com/playwright/python:v1.46.0-jammy
+# Use a standard Python image
+FROM python:3.10-slim
 
+# Set the working directory inside the container
 WORKDIR /app
 
+# Copy the requirements file and install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# bring all code in
-COPY . /app
+# IMPORTANT: Install Playwright's browser binaries and dependencies
+RUN playwright install --with-deps chromium
 
-ENV PYTHONUNBUFFERED=1
+# Copy the rest of your application code into the container
+COPY . .
 
-# URL is read from env var URL
-CMD ["bash","-lc","python solscan_railway.py --url \"$URL\""]
+# The command to run your script (Render will use its own Start Command)
+CMD ["python", "cabal_spy.py"]
