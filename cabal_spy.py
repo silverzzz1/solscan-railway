@@ -1,130 +1,98 @@
-import time
+import asyncio
 import re
+import time
 import os
-from collections import Counter
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+import aiohttp
+import threading, ctypes
+from collections import defaultdict
+from playwright.async_api import async_playwright
 
-# --- CONFIGURATION ---
-CABALSPY_URL = "https://cabalspy.xyz/dashboard.php"
-SCAN_INTERVAL_SECONDS = 160  # Check every 160 seconds
-MIN_KOL_COUNT = 22           # Alert threshold for KOL count
+# --- CONFIG ---
+WALLETS_MAP = {
+    "2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f": "Whale 1",
+    "8rvAsDKeAcEjEkiZMug9k8v1y8mW6gQQiMobd89Uy7qR": "Whale 2"
+}
+ALERT_THRESHOLD = 40.0
+COOLDOWN = 3600 
 
-# --- FILE PATH FOR SERVER ---
-ALERT_FILE = "alerted_tokens.txt"
+# Telegram Credentials
+BOT_TOKEN = "7847691278:AAE9ZSubv0MVn3S9sMT79X-b79TLCZ1-qVM"
+CHAT_ID = "-4637484974"
 
-# --- ALERT FILE LOGIC ---
-def load_alerted_tokens():
-    if not os.path.exists(ALERT_FILE):
-        return set()
-    with open(ALERT_FILE, 'r') as f:
-        return {line.strip().lower() for line in f}
+def desktop_popup(title, message):
+    """Windows-only popup for when you run it locally."""
+    if os.name == 'nt': 
+        def _show():
+            try: ctypes.windll.user32.MessageBoxW(0, message, title, 0x00001040)
+            except: pass
+        threading.Thread(target=_show, daemon=True).start()
 
-def save_alerted_token(token_name):
-    with open(ALERT_FILE, 'a') as f:
-        f.write(f"{token_name.lower()}\n")
+async def send_telegram(message):
+    """Sends alert to your Telegram group."""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    async with aiohttp.ClientSession() as session:
+        try:
+            payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
+            await session.post(url, json=payload)
+        except Exception as e:
+            print(f"Telegram failed: {e}")
 
-# --- SERVER-FRIENDLY ALERTING VIA PRINTING TO LOGS ---
-def trigger_alert_and_save(token_name, kol_count, market_cap, dev_bought):
-    print("\n" + "="*40)
-    print("🚨🚨🚨 NEW HIGH KOL TOKEN DETECTED! 🚨🚨🚨")
-    print(f"    Token: {token_name}")
-    print(f"    KOLs: {kol_count}")
-    print(f"    Market Cap: {market_cap}")
-    print(f"    Dev Bought: {dev_bought}")
-    print("="*40 + "\n")
-    try:
-        save_alerted_token(token_name)
-        print(f"✅ Saved '{token_name}' to alert history.")
-    except Exception as e:
-        print(f"❌ Could not save alert to file: {e}")
+def parse_time_ago(time_str: str) -> int:
+    nums = re.findall(r'\d+', time_str or "")
+    if not nums: return 999
+    val = int(nums[0])
+    if 's' in time_str: return 0
+    if 'm' in time_str: return val
+    if 'h' in time_str: return val * 60
+    return val
 
-# --- TOKEN DATA EXTRACTION ---
-def extract_kol_count(text):
-    try:
-        return int(re.findall(r'\d+', text)[0])
-    except (IndexError, TypeError):
-        return 0
+async def monitor_single_wallet(browser, address, nickname):
+    context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+    page = await context.new_page()
+    alert_timestamps = {}
+    url = f"https://cabalspy.xyz/wallet.php?wallet={address}"
+    
+    while True:
+        try:
+            print(f"[{time.strftime('%H:%M:%S')}] Scanning {nickname}...")
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(5000) 
 
-def extract_token_ticker(text):
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
-    skip = ['KOL', 'Market Cap', 'Dev Bought', 'VIEW', 'VISUALIZE', 'TRADE', 'SPY']
-    for line in lines[:8]:
-        if not any(s in line.upper() for s in skip) and 2 < len(line) < 20 and not re.match(r'^[\d.+\-$%\s]+$', line):
-            return line
-    return "UNKNOWN_TOKEN"
+            rows = await page.query_selector_all("tr")
+            active_totals = defaultdict(float)
 
-def get_thumbnail_id(container):
-    try:
-        img = container.query_selector("img")
-        if img:
-            return (img.get_attribute("src") or "").strip().lower()
-    except Exception:
-        pass
-    return "no_thumb"
+            for row in rows:
+                txt = await row.inner_text()
+                if "BUY" in txt.upper():
+                    cells = await row.query_selector_all("td")
+                    if len(cells) >= 5:
+                        token = (await cells[1].inner_text()).split('\n')[0].strip()
+                        amt_raw = await cells[3].inner_text()
+                        amt = float(re.sub(r'[^\d.]', '', amt_raw.replace(',', '.')))
+                        minutes = parse_time_ago(await cells[4].inner_text())
+                        if minutes <= 8: active_totals[token] += amt
 
-def report_duplicates(tokens):
-    names = Counter(t['name'].lower() for t in tokens if t['name'] != "UNKNOWN_TOKEN")
-    dupes = [f"{name} (x{count})" for name, count in names.items() if count > 1]
-    if dupes:
-        print(f"⚠️  Duplicate token names on page: {', '.join(dupes)}")
+            for token, total in active_totals.items():
+                if total >= ALERT_THRESHOLD:
+                    now = time.time()
+                    if token not in alert_timestamps or (now - alert_timestamps[token] > COOLDOWN):
+                        msg = f"🚨 <b>{nickname}</b> bought <b>{token}</b>\nTotal: {total:.2f} SOL"
+                        desktop_popup("WHALE ALERT", msg.replace("<b>", "").replace("</b>", ""))
+                        await send_telegram(msg)
+                        alert_timestamps[token] = now
+        except Exception as e:
+            print(f"Error: {e}")
+        await asyncio.sleep(60)
 
-# --- SCANNING LOGIC ---
-def scan_page_for_tokens(page):
-    found_tokens = []
-    print("🔎 Scanning page for token cards...")
-    # This is a general selector for card-like elements. You may need to adjust it if the site changes.
-    containers = page.query_selector_all("div[class*='card'], div[class*='token'], div[class*='item']")
-    for container in containers:
-        text = container.inner_text()
-        if "KOL" not in text:
-            continue
-        kol_count = extract_kol_count(text)
-        if kol_count >= MIN_KOL_COUNT:
-            token = {
-                'name': extract_token_ticker(text),
-                'kol_count': kol_count,
-                'market_cap': (m.group(1).strip() if (m := re.search(r'Market Cap[:\s]*([^\n]+)', text)) else "Unknown"),
-                'dev_bought': (m.group(1).strip() if (m := re.search(r'Dev Bought[:\s]*([^\n]+)', text)) else "Unknown"),
-                'thumb_id': get_thumbnail_id(container)
-            }
-            found_tokens.append(token)
-    return found_tokens
-
-# --- MAIN LOOP ---
-def main():
-    print("🚀 CabalSpy KOL Token Scanner Starting.")
-    alerted_tokens = load_alerted_tokens()
-    print(f"📝 {len(alerted_tokens)} tokens loaded from alert history.")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        scan_count = 0
-        while True:
-            scan_count += 1
-            print("\n" + "="*60)
-            print(f"🔍 Scan #{scan_count} at {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            try:
-                page.goto(CABALSPY_URL, timeout=60000, wait_until='networkidle')
-                print("⏳ Page loaded, waiting for dynamic content...")
-                time.sleep(10) # Wait for JS rendering
-                
-                found_tokens = scan_page_for_tokens(page)
-                if not found_tokens:
-                    print("✅ No tokens matching criteria found in this scan.")
-                else:
-                    print(f"✅ Found {len(found_tokens)} potential tokens. Checking against history...")
-                    report_duplicates(found_tokens)
-                    unique_tokens = {t['name'].lower(): t for t in found_tokens}.values()
-                    for token in unique_tokens:
-                        if token['name'].lower() not in alerted_tokens:
-                            trigger_alert_and_save(token['name'], token['kol_count'], token['market_cap'], token['dev_bought'])
-                            alerted_tokens.add(token['name'].lower())
-                        else:
-                            print(f"  - Already alerted for '{token['name']}', skipping.")
-            except Exception as e:
-                print(f"❌ An error occurred during the scan cycle: {e}")
-            print(f"💤 Waiting {SCAN_INTERVAL_SECONDS} seconds...")
-            time.sleep(SCAN_INTERVAL_SECONDS)
+async def main():
+    async with async_playwright() as p:
+        is_linux = os.name != 'nt' # Render is Linux, your PC is Windows
+        browser = await p.chromium.launch(
+            headless=is_linux, 
+            args=["--no-sandbox", "--disable-dev-shm-usage"] if is_linux else []
+        )
+        tasks = [monitor_single_wallet(browser, addr, nick) for addr, nick in WALLETS_MAP.items()]
+        await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
